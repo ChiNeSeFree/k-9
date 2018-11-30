@@ -174,8 +174,7 @@ public class MailService extends CoreService {
         Timber.i("Saving lastCheckEnd = %tc", lastCheckEnd);
 
         Preferences prefs = Preferences.getPreferences(context);
-        Storage storage = prefs.getStorage();
-        StorageEditor editor = storage.edit();
+        StorageEditor editor = prefs.createStorageEditor();
         editor.putLong(LAST_CHECK_END, lastCheckEnd);
         editor.commit();
     }
@@ -259,7 +258,7 @@ public class MailService extends CoreService {
                 shortestInterval = account.getAutomaticCheckIntervalMinutes();
             }
         }
-        StorageEditor editor = storage.edit();
+        StorageEditor editor = prefs.createStorageEditor();
         editor.putInt(PREVIOUS_INTERVAL, shortestInterval);
         editor.commit();
 
