@@ -12,8 +12,8 @@ import android.database.sqlite.SQLiteDatabase;
 import android.support.annotation.VisibleForTesting;
 
 import com.fsck.k9.Account;
-import com.fsck.k9.core.BuildConfig;
 import com.fsck.k9.controller.MessageReference;
+import com.fsck.k9.core.BuildConfig;
 import com.fsck.k9.mail.Address;
 import com.fsck.k9.mail.Flag;
 import com.fsck.k9.mail.Folder;
@@ -27,6 +27,21 @@ import timber.log.Timber;
 
 
 public class LocalMessage extends MimeMessage {
+    private static final String OUTBOX_STATE_TABLE = "outbox_state";
+    private static final String OUTBOX_STATE__MESSAGE_ID = "message_id";
+    private static final String OUTBOX_STATE__SEND_STATE = "send_state";
+    private static final String OUTBOX_STATE__NUMBER_OF_SEND_ATTEMPTS = "number_of_send_attempts";
+    private static final String OUTBOX_STATE__ERROR_TIMESTAMP = "error_timestamp";
+    private static final String OUTBOX_STATE__ERROR = "error";
+
+    private static final String[] OUTBOX_STATE_COLUMNS = {
+            OUTBOX_STATE__SEND_STATE,
+            OUTBOX_STATE__NUMBER_OF_SEND_ATTEMPTS,
+            OUTBOX_STATE__ERROR_TIMESTAMP,
+            OUTBOX_STATE__ERROR
+    };
+
+
     private final LocalStore localStore;
 
     private long databaseId;
@@ -40,6 +55,12 @@ public class LocalMessage extends MimeMessage {
     private String mimeType;
     private PreviewType previewType;
     private boolean headerNeedsUpdating = false;
+
+    // Only available for messages in Outbox folder after calling fetchOutboxState()
+    private SendState sendState;
+    private int numberOfSendAttempts;
+    private String sendError;
+    private long sendErrorTimestamp;
 
 
     private LocalMessage(LocalStore localStore) {
@@ -250,6 +271,22 @@ public class LocalMessage extends MimeMessage {
         return databaseId;
     }
 
+    public SendState getSendState() {
+        return sendState;
+    }
+
+    public int getNumberOfSendAttempts() {
+        return numberOfSendAttempts;
+    }
+
+    public String getSendError() {
+        return sendError;
+    }
+
+    public long getSendErrorTimestamp() {
+        return sendErrorTimestamp;
+    }
+
     public boolean hasCachedDecryptedSubject() {
         return isSet(Flag.X_SUBJECT_DECRYPTED);
     }
@@ -457,6 +494,128 @@ public class LocalMessage extends MimeMessage {
         }
         
         headerNeedsUpdating = false;
+    }
+
+    public void fetchOutboxState() throws MessagingException {
+        localStore.getDatabase().execute(true, new DbCallback<Void>() {
+            @Override
+            public Void doDbWork(SQLiteDatabase db) throws WrappedException {
+                Cursor cursor = db.query(
+                        OUTBOX_STATE_TABLE,
+                        OUTBOX_STATE_COLUMNS,
+                        OUTBOX_STATE__MESSAGE_ID + " = ?",
+                        new String[] { Long.toString(databaseId) },
+                        null, null, null);
+
+                try {
+                    if (!cursor.moveToFirst()) {
+                        throw new IllegalStateException("No outbox_state entry for message with id " + databaseId);
+                    }
+
+                    String sendStateString = cursor.getString(cursor.getColumnIndex(OUTBOX_STATE__SEND_STATE));
+                    numberOfSendAttempts = cursor.getInt(cursor.getColumnIndex(OUTBOX_STATE__NUMBER_OF_SEND_ATTEMPTS));
+                    sendErrorTimestamp = cursor.getLong(cursor.getColumnIndex(OUTBOX_STATE__ERROR_TIMESTAMP));
+                    int sendErrorColumnIndex = cursor.getColumnIndex(OUTBOX_STATE__ERROR);
+                    sendError = cursor.isNull(sendErrorColumnIndex) ? null : cursor.getString(sendErrorColumnIndex);
+
+                    sendState = SendState.fromDatabaseName(sendStateString);
+
+                    return null;
+                } finally {
+                    cursor.close();
+                }
+            }
+        });
+    }
+
+    public void initializeOutboxState() throws MessagingException {
+        sendState = SendState.READY;
+        localStore.getDatabase().execute(false, new DbCallback<Void>() {
+            @Override
+            public Void doDbWork(final SQLiteDatabase db) throws WrappedException, UnavailableStorageException {
+                ContentValues cv = new ContentValues();
+                cv.put(OUTBOX_STATE__MESSAGE_ID, databaseId);
+                cv.put(OUTBOX_STATE__SEND_STATE, SendState.READY.getDatabaseName());
+
+                db.insert(OUTBOX_STATE_TABLE, null, cv);
+                return null;
+            }
+        });
+    }
+
+    public void removeOutboxState() throws MessagingException {
+        localStore.getDatabase().execute(false, new DbCallback<Void>() {
+            @Override
+            public Void doDbWork(SQLiteDatabase db) throws WrappedException {
+                db.delete(OUTBOX_STATE_TABLE, OUTBOX_STATE__MESSAGE_ID + " = ?",
+                        new String[] { Long.toString(databaseId) });
+                return null;
+            }
+        });
+    }
+
+    public void incrementSendAttempts() throws MessagingException {
+        numberOfSendAttempts++;
+        writeNumberOfSendAttempts(numberOfSendAttempts);
+    }
+
+    public void decrementSendAttempts() throws MessagingException {
+        numberOfSendAttempts--;
+        writeNumberOfSendAttempts(numberOfSendAttempts);
+    }
+
+    private void writeNumberOfSendAttempts(final int value) throws MessagingException {
+        localStore.getDatabase().execute(false, new DbCallback<Void>() {
+            @Override
+            public Void doDbWork(SQLiteDatabase db) throws WrappedException {
+                ContentValues cv = new ContentValues();
+                cv.put(OUTBOX_STATE__NUMBER_OF_SEND_ATTEMPTS, value);
+
+                db.update(OUTBOX_STATE_TABLE, cv, OUTBOX_STATE__MESSAGE_ID + " = ?",
+                        new String[] { Long.toString(databaseId) });
+                return null;
+            }
+        });
+    }
+
+    public void setSendAttemptError(final String errorMessage) throws MessagingException {
+        sendError = errorMessage;
+        sendErrorTimestamp = System.currentTimeMillis();
+        sendState = SendState.ERROR;
+
+        localStore.getDatabase().execute(false, new DbCallback<Void>() {
+            @Override
+            public Void doDbWork(SQLiteDatabase db) throws WrappedException, UnavailableStorageException {
+                ContentValues cv = new ContentValues();
+                cv.put(OUTBOX_STATE__SEND_STATE, SendState.ERROR.getDatabaseName());
+                cv.put(OUTBOX_STATE__ERROR_TIMESTAMP, sendErrorTimestamp);
+                cv.put(OUTBOX_STATE__ERROR, errorMessage);
+
+                db.update(OUTBOX_STATE_TABLE, cv, OUTBOX_STATE__MESSAGE_ID + " = ?",
+                        new String[] { Long.toString(databaseId) });
+                return null;
+            }
+        });
+    }
+
+    public void setSendAttemptsExceeded() throws MessagingException {
+        sendError = null;
+        sendErrorTimestamp = System.currentTimeMillis();
+        sendState = SendState.RETRIES_EXCEEDED;
+
+        localStore.getDatabase().execute(false, new DbCallback<Void>() {
+            @Override
+            public Void doDbWork(SQLiteDatabase db) throws WrappedException, UnavailableStorageException {
+                ContentValues cv = new ContentValues();
+                cv.put(OUTBOX_STATE__SEND_STATE, SendState.RETRIES_EXCEEDED.getDatabaseName());
+                cv.put(OUTBOX_STATE__ERROR_TIMESTAMP, sendErrorTimestamp);
+                cv.putNull(OUTBOX_STATE__ERROR);
+
+                db.update(OUTBOX_STATE_TABLE, cv, OUTBOX_STATE__MESSAGE_ID + " = ?",
+                        new String[] { Long.toString(databaseId) });
+                return null;
+            }
+        });
     }
 
     @Override
