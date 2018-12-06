@@ -57,6 +57,7 @@ class StoragePersisterTest : K9RobolectricTest() {
 
         try {
             storagePersister.doInTransaction(operationCallback)
+            fail("expected exception")
         } catch (e: Exception) {
             assertSame(exception, e)
         }
